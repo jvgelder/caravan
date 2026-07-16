@@ -21,16 +21,7 @@ function pubkeyFromSecret(secret: Buffer): Buffer {
 }
 
 function p2wpkhScript(pubkey: Buffer): Buffer {
-  // Test-only: use a fixed valid witness program derived from pubkey bytes.
-  // If the repo already has address/script helpers, prefer those.
-  const h = Buffer.from(
-    require("crypto")
-      .createHash("ripemd160")
-      .update(require("crypto").createHash("sha256").update(pubkey).digest())
-      .digest(),
-  );
-
-  return Buffer.concat([Buffer.from([0x00, 0x14]), h]);
+  return Buffer.concat([Buffer.from([0x00, 0x14]), hash160(pubkey)]);
 }
 
 // ── Invalid vectors ────────────────────────────────────────────────────────

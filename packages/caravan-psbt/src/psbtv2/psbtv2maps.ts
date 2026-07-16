@@ -192,10 +192,15 @@ export abstract class PsbtV2Maps {
  */
 export class PsbtConversionMaps extends PsbtV2Maps {
   /**
-   * Builds the unsigned transaction that is required on global map key 0x00 for
-   * a PSBTv0. Relies on bitcoinjs-lib to construct the transaction.
+   * Builds a transaction using the supplied output-script resolver.
    */
-  private buildUnsignedTx() {
+  private buildTransaction(
+    outputScriptFor: (
+      script: Value | undefined,
+      spInfo: Value | undefined,
+      outputIndex: number,
+    ) => Buffer,
+  ) {
     const tx = new Transaction();
 
     tx.version =
@@ -241,12 +246,7 @@ export class PsbtConversionMaps extends PsbtV2Maps {
       ).readBigInt64LE();
       const numberAmount = parseInt(bigintAmount.toString());
 
-      // BIP375 unique identification uses v0 || Bscan || Bspend when
-      // PSBT_OUT_SP_V0_INFO is present, so the txid is stable before and after
-      // the real output script has been computed.
-      const outputScript = spInfo
-        ? Buffer.concat([Buffer.from([0x00]), spInfo])
-        : (script as Buffer);
+      const outputScript = outputScriptFor(script, spInfo, i);
       tx.addOutput(outputScript, numberAmount);
     }
 
@@ -256,16 +256,28 @@ export class PsbtConversionMaps extends PsbtV2Maps {
   /**
    * Warns and then deletes map values. Intended for use when converting to a
    * PsbtV0.
+   *
+   * Matches on the keytype prefix rather than the whole key, because keys are
+   * stored as the hex of keytype || keydata. Fields carrying keydata — the
+   * BIP375 ECDH share and DLEQ proof types, which are suffixed with a 33-byte
+   * scan key — are never equal to their bare keytype and would otherwise
+   * survive the conversion. Every KeyType is a single byte and a stored key
+   * always begins with its full keytype, so no prefix collisions are possible.
    */
-  private v0delete(map: Map<Key, Value>, key: KeyType) {
-    if (map.has(key)) {
-      const keyName = Object.keys(KeyType)[Object.values(KeyType).indexOf(key)];
-      console.warn(
-        `Key ${keyName} key is not supported on PSBTv0 and will be omitted.`,
-      );
+  private v0delete(map: Map<Key, Value>, keyType: KeyType) {
+    const matches = [...map.keys()].filter((key) => key.startsWith(keyType));
+
+    if (matches.length === 0) {
+      return;
     }
 
-    map.delete(key);
+    const keyName =
+      Object.keys(KeyType)[Object.values(KeyType).indexOf(keyType)];
+    console.warn(
+      `Key ${keyName} key is not supported on PSBTv0 and will be omitted.`,
+    );
+
+    matches.forEach((key) => map.delete(key));
   }
 
   /**
@@ -306,8 +318,40 @@ export class PsbtConversionMaps extends PsbtV2Maps {
     }
   };
 
+  /**
+   * Builds the real unsigned transaction used by PSBTv0 conversion.
+   * Silent-payment outputs must already have their derived output script.
+   */
+  private buildUnsignedTx() {
+    return this.buildTransaction((script, spInfo, outputIndex) => {
+      if (spInfo && !script) {
+        throw Error(
+          `Cannot build a transaction for output ${outputIndex}: ` +
+            `PSBT_OUT_SP_V0_INFO is set but PSBT_OUT_SCRIPT has not been ` +
+            `computed. Per BIP375, a silent payment PSBT is only backwards ` +
+            `compatible once every output script is set.`,
+        );
+      }
+
+      return script as Buffer;
+    });
+  }
+
+  /**
+   * Builds the transaction serialization used only for BIP375 unique
+   * identification. Silent-payment outputs substitute
+   * 0x00 || Bscan || Bspend for PSBT_OUT_SCRIPT.
+   */
+  private buildPsbtIdentifierTx() {
+    return this.buildTransaction((script, spInfo) =>
+      spInfo
+        ? Buffer.concat([Buffer.from([0x00]), spInfo as Buffer])
+        : (script as Buffer),
+    );
+  }
+
   public getTransactionId() {
-    const txBuf = this.buildUnsignedTx();
+    const txBuf = this.buildPsbtIdentifierTx();
     try {
       return Transaction.fromBuffer(txBuf).getId();
     } catch (e) {

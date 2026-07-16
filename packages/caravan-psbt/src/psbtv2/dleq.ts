@@ -128,8 +128,8 @@ export function generateDLEQProof({
     throw new Error("BIP374 proof generation produced point at infinity.");
   }
 
-  const ABytes = Buffer.from(A.toRawBytes(true));
-  const CBytes = Buffer.from(C.toRawBytes(true));
+  const ABytes = pointToCompressedBytes(A);
+  const CBytes = pointToCompressedBytes(C);
 
   const t = xor32(secret, taggedHash("BIP0374/aux", auxRand));
 
@@ -235,17 +235,17 @@ export function verifyDLEQProof({
   proof: Buffer;
   message?: Buffer;
 }): boolean {
-  let A: ProjectivePoint;
-  let B: ProjectivePoint;
-  let C: ProjectivePoint;
-
+  // The verification itself is inside the try as well as the point parsing:
+  // a crafted proof with s = 0 (or e congruent to 0 mod n) makes noble's
+  // multiply() throw rather than yielding a bad point, and a verifier should
+  // answer false rather than raise.
   try {
-    A = pointFromCompressed(publicKey);
-    B = pointFromCompressed(basePoint);
-    C = pointFromCompressed(result);
+    const A = pointFromCompressed(publicKey);
+    const B = pointFromCompressed(basePoint);
+    const C = pointFromCompressed(result);
+
+    return verifyDLEQProofForPoints({ A, B, C, proof, message });
   } catch {
     return false;
   }
-
-  return verifyDLEQProofForPoints({ A, B, C, proof, message });
 }

@@ -9,14 +9,13 @@
  */
 
 import { secp256k1, schnorr } from "@noble/curves/secp256k1";
-import { createHash } from "crypto";
-import { script } from "bitcoinjs-lib-v6";
+import { script, Transaction } from "bitcoinjs-lib-v6";
 import { taggedHash } from "./functions";
 
 const CURVE_ORDER = secp256k1.CURVE.n;
 const { bytesToNumberBE } = schnorr.utils;
 const { OPS } = script;
-import { Transaction } from "bitcoinjs-lib-v6";
+import { hash160 } from "@caravan/bitcoin";
 import {
   generateDLEQProof,
   multiplyCompressedPoint,
@@ -91,28 +90,6 @@ export function assertValidBscan(bscan: Buffer): void {
   assertValidCompressedPoint(bscan, "bscan");
 }
 
-export function parseSilentPaymentScanKeyData(
-  key: string,
-  keyType: string,
-  context: string,
-): Buffer {
-  const scanKey = key.slice(keyType.length);
-  if (!/^[0-9a-fA-F]+$/.test(scanKey)) {
-    throw new Error(`${context} scan keydata must be hex encoded.`);
-  }
-  const bscan = Buffer.from(scanKey, "hex");
-  assertValidBscan(bscan);
-  return bscan;
-}
-
-export function scanKeyHexFromBIP375Key(
-  key: string,
-  keyType: string,
-  context: string,
-): string {
-  return parseSilentPaymentScanKeyData(key, keyType, context).toString("hex");
-}
-
 /**
  * Asserts that a spend public key is a valid 33-byte compressed point.
  *
@@ -172,10 +149,17 @@ export function assertValidLabel(m: number, outputIndex: number): void {
   }
 }
 
+/**
+ * Maximum number of silent payment addresses sharing one scan key in a single
+ * transaction, from BIP352 ("why_limit_k"): the most P2TR outputs that fit in a
+ * 100 kvB standard transaction.
+ */
+export const BIP352_K_MAX = 2323;
+
 export function assertValidOutputK(k: number, outputIndex: number): void {
-  if (!Number.isInteger(k) || k < 0 || k > 2323) {
+  if (!Number.isInteger(k) || k < 0 || k >= BIP352_K_MAX) {
     throw new Error(
-      `Silent payment recipient index should be 0 < k < 2323 (Kmax) but was at output ${outputIndex}: ${k}`,
+      `Silent payment recipient index should be 0 <= k < ${BIP352_K_MAX} (Kmax) but was at output ${outputIndex}: ${k}`,
     );
   }
 }
@@ -188,10 +172,51 @@ function assertValidScalar(value: bigint, name: string): void {
 
 // ── Eligible input indices ─────────────────────────────────────────────────
 
+function readCompactSize(
+  buffer: Buffer,
+  offset: number,
+): { value: number; size: number } | null {
+  if (offset >= buffer.length) return null;
+
+  const first = buffer[offset];
+  if (first < 0xfd) {
+    return { value: first, size: 1 };
+  }
+
+  if (first === 0xfd) {
+    if (offset + 3 > buffer.length) return null;
+    const value = buffer.readUInt16LE(offset + 1);
+    if (value < 0xfd) return null;
+    return { value, size: 3 };
+  }
+
+  if (first === 0xfe) {
+    if (offset + 5 > buffer.length) return null;
+    const value = buffer.readUInt32LE(offset + 1);
+    if (value <= 0xffff) return null;
+    return { value, size: 5 };
+  }
+
+  if (offset + 9 > buffer.length) return null;
+  const value = buffer.readBigUInt64LE(offset + 1);
+  if (value <= 0xffffffffn || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+
+  return { value: Number(value), size: 9 };
+}
+
 function readWitnessUtxoScript(witnessUtxo: Buffer): Buffer {
   if (witnessUtxo.length < 9) return Buffer.alloc(0);
-  const scriptLen = witnessUtxo[8];
-  return witnessUtxo.subarray(9, 9 + scriptLen);
+
+  const scriptLength = readCompactSize(witnessUtxo, 8);
+  if (!scriptLength) return Buffer.alloc(0);
+
+  const scriptStart = 8 + scriptLength.size;
+  const scriptEnd = scriptStart + scriptLength.value;
+  if (scriptEnd !== witnessUtxo.length) return Buffer.alloc(0);
+
+  return witnessUtxo.subarray(scriptStart, scriptEnd);
 }
 
 function readNonWitnessUtxoScript(
@@ -245,14 +270,8 @@ export function classifyWitnessScript(scriptPubKey: Buffer): SPInputScriptType {
   ) {
     return "p2pkh_or_unknown_legacy";
   }
-  if (
-    scriptPubKey.length === 23 &&
-    scriptPubKey[0] === OPS.OP_HASH160 &&
-    scriptPubKey[1] === 0x14 &&
-    scriptPubKey[22] === OPS.OP_EQUAL
-  ) {
-    return "ineligible";
-  }
+  // Bare P2SH falls through: eligibility depends on the redeem script, which is
+  // resolved by classifyInputDescriptor.
   return "ineligible";
 }
 
@@ -268,10 +287,6 @@ export function classifyInputDescriptor(
   }
 
   const scriptType = classifyWitnessScript(script);
-
-  if (scriptType === "p2sh_p2wpkh") {
-    return scriptType;
-  }
 
   if (
     script.length === 23 &&
@@ -373,11 +388,6 @@ export function getTaprootOutputKeyFromWitnessUtxo(
   const scriptPubKey = readWitnessUtxoScript(witnessUtxo);
   if (classifyWitnessScript(scriptPubKey) !== "p2tr") return null;
   return Buffer.concat([Buffer.from([0x02]), scriptPubKey.subarray(2, 34)]);
-}
-
-function hash160(buffer: Buffer): Buffer {
-  const sha = createHash("sha256").update(buffer).digest();
-  return createHash("ripemd160").update(sha).digest();
 }
 
 export function getSilentPaymentPubkeyFromInputDescriptor(
@@ -560,6 +570,12 @@ export function deriveSilentPaymentOutput(
   return Buffer.concat([Buffer.from([OPS.OP_1, 0x20]), xOnlyPk]);
 }
 
+/**
+ * Produces the BIP374 DLEQ proof that accompanies a BIP375 ECDH share.
+ *
+ * @internal Not exported from the package root. Reach for this only from within
+ * @caravan/psbt until the signer path settles what it needs.
+ */
 export function generateSilentPaymentDLEQProof({
   secret,
   scanKey,
@@ -591,6 +607,13 @@ export function generateSilentPaymentDLEQProof({
   };
 }
 
+/**
+ * Verifies the BIP374 DLEQ proof accompanying a BIP375 ECDH share. Returns
+ * false for malformed input rather than throwing.
+ *
+ * @internal Not exported from the package root. Reach for this only from within
+ * @caravan/psbt until the signer path settles what it needs.
+ */
 export function verifySilentPaymentDLEQProof({
   publicKey,
   scanKey,

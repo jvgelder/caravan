@@ -481,8 +481,14 @@ export class PsbtV2 extends PsbtV2Maps {
     for (const map of this.outputMaps) {
       const value = map.get(KeyType.PSBT_OUT_SCRIPT);
       if (!value) {
-        // This should never happen, but it can't be gracefully handled.
-        throw Error("PSBT_OUT_SCRIPT not set for an output");
+        // Reachable for a BIP375 PSBT whose silent payment output scripts have
+        // not been computed yet. Signature is left as string[] deliberately:
+        // widening it to (string | null)[] would break existing consumers.
+        throw Error(
+          "PSBT_OUT_SCRIPT not set for an output. If this PSBT has silent " +
+            "payment outputs, check hasAllSPOutputScripts before reading " +
+            "output scripts.",
+        );
       }
       indices.push(value.toString("hex"));
     }
@@ -600,12 +606,9 @@ export class PsbtV2 extends PsbtV2Maps {
       return false;
     }
 
-    // Per BIP375: if SP outputs are present, all must have a computed
-    // PSBT_OUT_SCRIPT before signing is permitted.
-    if (this.hasSilentPaymentOutputs && !this.hasAllSPOutputScripts) {
-      return false;
-    }
-    return true;
+    // For non-SP transactions this is vacuously true. For SP transactions,
+    // every SP output must have a non-empty PSBT_OUT_SCRIPT before signing.
+    return this.hasAllSPOutputScripts;
   }
 
   /**
@@ -879,23 +882,24 @@ export class PsbtV2 extends PsbtV2Maps {
     });
   }
 
-  private getSilentPaymentOutputGroups(
-    onlyWithScripts = false,
-    skipLabeled = false,
-  ): Map<string, SPOutputEntry[]> {
+  /**
+   * Groups every silent payment output by scan key.
+   *
+   * The group must contain all of a scan key's outputs, including labeled ones
+   * and ones whose PSBT_OUT_SCRIPT has not been computed yet, because BIP352
+   * assigns k by position within the full group. Filtering members out here
+   * would renumber the survivors.
+   *
+   * Labeled outputs need no special handling: BIP352 publishes the address as
+   * (Bscan, Bm), so PSBT_OUT_SP_V0_INFO already carries the label-tweaked spend
+   * key and derivation is identical to the unlabeled case. See bitcoin/bips#2207.
+   */
+  private getSilentPaymentOutputGroups(): Map<string, SPOutputEntry[]> {
     const entries: SPOutputEntry[] = [];
 
     for (let i = 0; i < this.outputMaps.length; i++) {
       const info = this.getSilentPaymentOutputInfo(i);
       if (!info) continue;
-
-      if (skipLabeled && this.outputMaps[i].has(KeyType.PSBT_OUT_SP_V0_LABEL)) {
-        continue;
-      }
-
-      if (onlyWithScripts && !this.hasNonEmptyOutputScript(i)) {
-        continue;
-      }
 
       entries.push({ outputIndex: i, ...info });
     }
@@ -967,7 +971,7 @@ export class PsbtV2 extends PsbtV2Maps {
       );
 
       if (!pubkeyBytes) {
-        continue;
+        return null;
       }
 
       const point = secp256k1.ProjectivePoint.fromHex(pubkeyBytes);
@@ -1010,14 +1014,15 @@ export class PsbtV2 extends PsbtV2Maps {
   /**
    * Resolves the ECDH share for a scan key while verifying its DLEQ proof(s).
    *
-   * Returns the share — either the global share or the sum of per-input shares
-   * — or null when the scan key's output is still in progress (no derivable
-   * share has been contributed yet).
+   * Returns the share — either the global share or the sum of per-input shares.
+   * Throws rather than returning null: callers only reach this once a scan key
+   * has a computed output script, at which point every part of the derivation
+   * must be present.
    */
   private resolveAndVerifyScanKeyEcdhShare(
     bscanHex: string,
     contributingInputs: number[],
-  ): Buffer | null {
+  ): Buffer {
     const globalShareKey = KeyType.PSBT_GLOBAL_SP_ECDH_SHARE + bscanHex;
 
     if (this.globalMap.has(globalShareKey)) {
@@ -1031,11 +1036,7 @@ export class PsbtV2 extends PsbtV2Maps {
         );
       }
 
-      const aggregatePubkey =
-        this.tryGetInputAggregatePubkey(contributingInputs);
-      if (!aggregatePubkey) {
-        return null;
-      }
+      const aggregatePubkey = this.getInputAggregatePubkey(contributingInputs);
 
       if (
         !verifySilentPaymentDLEQProof({
@@ -1104,10 +1105,6 @@ export class PsbtV2 extends PsbtV2Maps {
       perInputBuffers.push(ecdhShare);
     }
 
-    if (perInputBuffers.length === 0) {
-      return null;
-    }
-
     return Buffer.from(sumECDHShares(perInputBuffers).toRawBytes(true));
   }
 
@@ -1135,28 +1132,28 @@ export class PsbtV2 extends PsbtV2Maps {
           `PsbtV2 output ${i} has PSBT_OUT_SP_V0_LABEL but no PSBT_OUT_SP_V0_INFO.`,
         );
       }
-
       if (spInfo) {
         assertValidSPV0Info(spInfo, i);
+      } else {
+        continue;
       }
 
-      if (!spInfo && !script) {
-        throw Error(
-          `PsbtV2 output ${i} is missing PSBT_OUT_SCRIPT and has no ` +
-            "PSBT_OUT_SP_V0_INFO. An output must have one or both per BIP375.",
-        );
-      }
-
-      if (spInfo && script && script.length === 0) {
+      if (
+        outputMap.has(KeyType.PSBT_OUT_SCRIPT) &&
+        !this.hasNonEmptyOutputScript(i)
+      ) {
         throw Error(`PsbtV2 output ${i} has empty PSBT_OUT_SCRIPT.`);
       }
 
-      if (spInfo && script && script.length > 0) {
-        if (this.PSBT_GLOBAL_TX_MODIFIABLE.length > 0) {
-          throw Error(
-            "PSBT_OUT_SCRIPT set for silent payment output but PSBT_GLOBAL_TX_MODIFIABLE is not zeroed.",
-          );
-        }
+      if (
+        spInfo &&
+        script &&
+        script.length > 0 &&
+        this.PSBT_GLOBAL_TX_MODIFIABLE.length > 0
+      ) {
+        throw Error(
+          "PSBT_OUT_SCRIPT set for silent payment output but PSBT_GLOBAL_TX_MODIFIABLE is not zeroed.",
+        );
       }
     }
 
@@ -1218,15 +1215,41 @@ export class PsbtV2 extends PsbtV2Maps {
           );
         }
       }
+
+      // PSBT_IN_SIGHASH_TYPE is optional, so a PSBT arriving from another
+      // signer can carry a non-SIGHASH_ALL signature without declaring it. The
+      // flag is the last byte of an ECDSA signature.
+      //
+      // Deliberately scoped to PSBT_IN_PARTIAL_SIG: taproot signatures live in
+      // PSBT_IN_TAP_KEY_SIG / PSBT_IN_TAP_SCRIPT_SIG, where a 64-byte signature
+      // means SIGHASH_DEFAULT and has no trailing flag byte to read.
+      for (const [key, sig] of inputMap) {
+        if (!key.startsWith(KeyType.PSBT_IN_PARTIAL_SIG)) continue;
+
+        if (
+          sig.length === 0 ||
+          sig[sig.length - 1] !== SighashType.SIGHASH_ALL
+        ) {
+          throw Error(
+            `PsbtV2 input ${i} has a non-SIGHASH_ALL partial signature with silent payments.`,
+          );
+        }
+      }
     }
 
     // ECDH coverage is only required per scan key that has a computed SP output
-    // script. Scan keys whose outputs are still in progress (no PSBT_OUT_SCRIPT)
-    // may have missing ECDH/DLEQ data. Labeled outputs are skipped here until
-    // label-aware public recomputation is implemented.
-    const outputGroups = this.getSilentPaymentOutputGroups(true, true);
+    // script. Scan keys whose outputs are all still in progress (no
+    // PSBT_OUT_SCRIPT anywhere in the group) may have missing ECDH/DLEQ data.
+    //
+    // Note the gate is per group, not per output: every member of a selected
+    // group stays in it so that k keeps counting across outputs that have no
+    // script yet.
+    const outputGroups = [...this.getSilentPaymentOutputGroups()].filter(
+      ([, group]) =>
+        group.some((entry) => this.hasNonEmptyOutputScript(entry.outputIndex)),
+    );
 
-    if (outputGroups.size === 0) {
+    if (outputGroups.length === 0) {
       return;
     }
 
@@ -1243,12 +1266,6 @@ export class PsbtV2 extends PsbtV2Maps {
         bscanHex,
         contributingInputs,
       );
-
-      if (!ecdhShare) {
-        throw Error(
-          `Missing silent payment ECDH share for scan key ${bscanHex}.`,
-        );
-      }
 
       for (let k = 0; k < group.length; k++) {
         const { outputIndex, bspend } = group[k];
@@ -1547,21 +1564,12 @@ export class PsbtV2 extends PsbtV2Maps {
 
     if (silentPayment) {
       const { bscan, bspend, label } = silentPayment;
-      assertValidBscan(bscan);
-      assertValidBspend(bspend);
-      // Value: bscan || bspend, 66 bytes — no version prefix in field value.
-      const spBw = new BufferWriter();
-      spBw.writeBytes(bscan);
-      spBw.writeBytes(bspend);
-      map.set(KeyType.PSBT_OUT_SP_V0_INFO, spBw.render());
+      const outputIndex = this.outputMaps.length;
+
+      this.setOutputSPInfoOnMap(map, bscan, bspend);
 
       if (label !== undefined) {
-        if (!Number.isInteger(label) || label < 0 || label > 0xffffffff) {
-          throw Error(`label must be a uint32 (0–${0xffffffff}), got ${label}`);
-        }
-        const labelBw = new BufferWriter();
-        labelBw.writeU32(label);
-        map.set(KeyType.PSBT_OUT_SP_V0_LABEL, labelBw.render());
+        this.setOutputSPLabelOnMap(map, outputIndex, label);
       }
     }
 
@@ -1689,32 +1697,20 @@ export class PsbtV2 extends PsbtV2Maps {
       );
     }
 
-    if (this.hasSilentPaymentOutputs) {
-      if (sig.length === 0) {
-        throw Error("PsbtV2.addPartialSig() received empty signature.");
-      }
-
-      const sighashType = sig[sig.length - 1];
-
-      if (sighashType !== SighashType.SIGHASH_ALL) {
-        throw Error(
-          "Silent payment PSBTs require partial signatures to use SIGHASH_ALL.",
-        );
-      }
-    }
-
-    // Per BIP375: re-verify silent-payment consistency on the live object before
-    // a signature locks the inputs. No-op when there are no SP outputs.
-    this.validateSilentPayments();
-
     const modBackup = this.PSBT_GLOBAL_TX_MODIFIABLE;
     try {
       this.inputMaps[inputIndex].set(key, sig);
       this.handleSighashType(sig);
-    } catch {
+
+      // Per BIP375: re-verify silent-payment consistency on the live object
+      // once the signature is in place, so the SIGHASH_ALL rule is enforced by
+      // the same code that checks it on parse. No-op without SP outputs.
+      this.validateSilentPayments();
+    } catch (e) {
       // To remain atomic, attempt to reset everything to the way it was.
       this.inputMaps[inputIndex].delete(key);
       this.PSBT_GLOBAL_TX_MODIFIABLE = modBackup;
+      throw e;
     }
   }
 
@@ -1860,41 +1856,35 @@ export class PsbtV2 extends PsbtV2Maps {
     this.inputMaps[inputIndex].set(key, proof);
   }
 
-  // ── Per-output SP methods ─────────────────────────────────────────────────
-
-  public addOutputSPInfo(
-    outputIndex: number,
+  // ── Per-output SP helpers ─────────────────────────────────────────────────
+  private setOutputSPInfoOnMap(
+    map: Map<Key, Value>,
     bscan: Buffer,
     bspend: Buffer,
   ): void {
-    if (outputIndex < 0 || outputIndex >= this.outputMaps.length) {
-      throw new Error(
-        `outputIndex ${outputIndex} out of range (${this.outputMaps.length} outputs)`,
-      );
-    }
     assertValidBscan(bscan);
     assertValidBspend(bspend);
+
     const bw = new BufferWriter();
     bw.writeBytes(bscan);
     bw.writeBytes(bspend);
-    this.outputMaps[outputIndex].set(KeyType.PSBT_OUT_SP_V0_INFO, bw.render());
+    map.set(KeyType.PSBT_OUT_SP_V0_INFO, bw.render());
   }
 
-  public addOutputSPLabel(outputIndex: number, label: number): void {
-    if (outputIndex < 0 || outputIndex >= this.outputMaps.length) {
-      throw new Error(
-        `outputIndex ${outputIndex} out of range (${this.outputMaps.length} outputs)`,
-      );
+  private setOutputSPLabelOnMap(
+    map: Map<Key, Value>,
+    outputIndex: number,
+    label: number,
+  ): void {
+    if (!map.has(KeyType.PSBT_OUT_SP_V0_INFO)) {
+      throw new Error(`Output ${outputIndex} has no SP info.`);
     }
-    if (!this.outputMaps[outputIndex].has(KeyType.PSBT_OUT_SP_V0_INFO)) {
-      throw new Error(
-        `Output ${outputIndex} has no SP info. Call addOutputSPInfo first.`,
-      );
-    }
+
     assertValidLabel(label, outputIndex);
+
     const bw = new BufferWriter();
     bw.writeU32(label);
-    this.outputMaps[outputIndex].set(KeyType.PSBT_OUT_SP_V0_LABEL, bw.render());
+    map.set(KeyType.PSBT_OUT_SP_V0_LABEL, bw.render());
   }
 
   /**
@@ -2233,12 +2223,11 @@ export class PsbtV2 extends PsbtV2Maps {
    * Per BIP375: the Signer must not add a signature until this is true.
    */
   get hasAllSPOutputScripts(): boolean {
-    return this.outputMaps.every((map) => {
-      if (!map.has(KeyType.PSBT_OUT_SP_V0_INFO)) return true;
-
-      const script = map.get(KeyType.PSBT_OUT_SCRIPT);
-      return !!script && script.length > 0;
-    });
+    return this.outputMaps.every(
+      (map, i) =>
+        !map.has(KeyType.PSBT_OUT_SP_V0_INFO) ||
+        this.hasNonEmptyOutputScript(i),
+    );
   }
 
   /**
@@ -2328,18 +2317,6 @@ export class PsbtV2 extends PsbtV2Maps {
       throw new Error("No silent payment outputs found.");
     }
 
-    const hasLabeledSilentPaymentOutput = this.outputMaps.some(
-      (map) =>
-        map.has(KeyType.PSBT_OUT_SP_V0_INFO) &&
-        map.has(KeyType.PSBT_OUT_SP_V0_LABEL),
-    );
-
-    if (hasLabeledSilentPaymentOutput) {
-      throw new Error(
-        "Cannot compute labeled silent payment output scripts without label tweak derivation.",
-      );
-    }
-
     if (!this.hasCompleteECDHCoverage()) {
       throw new Error(
         "Incomplete ECDH coverage — call addGlobalSPECDHShare or " +
@@ -2357,25 +2334,18 @@ export class PsbtV2 extends PsbtV2Maps {
     const contributing = this.getContributingInputsForSilentPayments();
     const inputHash = this.computeSilentPaymentInputHash(contributing);
 
-    if (!inputHash) {
-      throw new Error("Could not extract public keys from eligible inputs.");
-    }
-
     // ── Step 2: Group SP outputs by Bscan, sort within groups ──────────────
     const scanKeyGroups = this.getSilentPaymentOutputGroups();
 
     // ── Step 3: Resolve ECDH share and derive output scripts ───────────────
     for (const [bscanHex, group] of scanKeyGroups) {
+      // The producer is about to derive the script, so the share must be fully
+      // derivable and its DLEQ proof(s) verified before deriving. This throws
+      // if either is missing.
       const ecdhShare = this.resolveAndVerifyScanKeyEcdhShare(
         bscanHex,
         contributing,
       );
-
-      // The producer is about to derive the script, so the share must be fully
-      // derivable and its DLEQ proof(s) verified before deriving.
-      if (!ecdhShare) {
-        throw new Error(`No ECDH share found for scan key ${bscanHex}`);
-      }
 
       for (let k = 0; k < group.length; k++) {
         const { outputIndex, bspend } = group[k];
@@ -2394,10 +2364,15 @@ export class PsbtV2 extends PsbtV2Maps {
     }
 
     // ── Step 4: Lock modifiable flags per BIP375 ───────────────────────────
+    // BIP375 requires the Inputs and Outputs Modifiable flags to be cleared.
+    // SIGHASH_SINGLE is cleared too so the field is fully zeroed, which is what
+    // validateSilentPayments() checks for; the flag is meaningless here anyway,
+    // since silent payments mandate SIGHASH_ALL.
     this.PSBT_GLOBAL_TX_MODIFIABLE = this.PSBT_GLOBAL_TX_MODIFIABLE.filter(
       (f) =>
         f !== PsbtGlobalTxModifiableBits.INPUTS &&
-        f !== PsbtGlobalTxModifiableBits.OUTPUTS,
+        f !== PsbtGlobalTxModifiableBits.OUTPUTS &&
+        f !== PsbtGlobalTxModifiableBits.SIGHASH_SINGLE,
     );
   }
 }

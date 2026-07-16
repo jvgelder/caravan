@@ -10,6 +10,18 @@ Add BIP375 silent payment sending support to PsbtV2
 - Add silentPayment option to addOutput() for SP output construction
 - Add computeSilentPaymentOutputScripts() implementing BIP352 derivation
 - Add hasSilentPaymentOutputs, hasAllSPOutputScripts, hasCompleteECDHCoverage predicates
-- Add eligibleIndices, sumECDHShares, computeInputHash, deriveSilentPaymentOutput to silentpayment.ts
 - Update isReadyForSigner to enforce BIP375 signing rules
 - Update getTransactionId() for BIP375 unique identification
+
+Behaviour changes to existing APIs:
+
+- addPartialSig() now rethrows after rolling back. It previously swallowed
+  errors from handleSighashType(), leaving callers to believe a signature had
+  been added when it had not.
+- convertToV0() now throws when a silent payment output has no computed
+  PSBT_OUT_SCRIPT. Per BIP375 such a PSBT is not backwards compatible, and the
+  unique-identification placeholder must never reach a real transaction.
+
+The silent payment helpers in silentpayment.ts and dleq.ts are internal and are
+deliberately not exported from the package root; the public surface will be
+settled alongside the signer/coordinator integration.
